@@ -24,9 +24,8 @@ DRY_RUN=no
 CRON_MODE=no
 CONFIG_FILE=""
 
-
-# Temporary files (set in main, cleaned up on exit)
-declare -a TEMP_FILES=()
+# Scratch directory for this run (created in main, removed on exit)
+TEMP_DIR=""
 
 #=============================================================================
 # UTILITY FUNCTIONS
@@ -76,22 +75,6 @@ die() {
 show_progress() {
   [[ "$CRON_MODE" == "yes" ]] && return 0
   echo -n "."
-}
-
-# Create temp file and register for cleanup
-make_temp() {
-  local tmp
-  tmp=$(mktemp)
-  TEMP_FILES+=("$tmp")
-  echo "$tmp"
-}
-
-# Cleanup temporary files
-cleanup() {
-  for f in "${TEMP_FILES[@]:-}"; do
-    [[ -f "$f" ]] && rm -f "$f" || true
-  done
-  return 0
 }
 
 # Show usage information
@@ -329,7 +312,7 @@ check_nft_table() {
 # Create the complete nftables structure (table, sets, chain)
 create_nft_structure() {
   local nft_script
-  nft_script=$(make_temp)
+  nft_script="$TEMP_DIR/nft_script"
 
   # Build optional forward chain block
   local forward_chain=""
@@ -403,8 +386,11 @@ output_chunked_elements() {
 }
 
 # Generate nftables script for atomic update
+# Args: $1=ipv4 list, $2=ipv6 list, $3=output script,
+#       $4=ipv4 raw download, $5=ipv6 raw download
 generate_nft_script() {
   local ipv4_file="$1" ipv6_file="$2" output_script="$3"
+  local ipv4_raw_file="$4" ipv6_raw_file="$5"
 
   {
     echo "#!/usr/sbin/nft -f"
@@ -412,8 +398,30 @@ generate_nft_script() {
     echo "# nftables-blacklist atomic update"
     echo "# Generated: $(date -Iseconds)"
     echo ""
-    echo "flush set inet ${NFT_TABLE_NAME} ${NFT_SET_NAME_V4}"
-    echo "flush set inet ${NFT_TABLE_NAME} ${NFT_SET_NAME_V6}"
+    # Flush a set unless this run collected nothing for that family. An
+    # enabled family whose downloads produced no addresses (its feed was
+    # down, or no feed carries that family) keeps whatever the set already
+    # holds - flushing it would silently wipe the live blacklist, the same
+    # failure the "No IPs collected" guard in main() prevents, one family
+    # at a time.
+    #
+    # The decision keys on the RAW download, not on the processed list: a
+    # family whose entries were all removed by private-range filtering or
+    # by the whitelist did collect addresses, and its set must still be
+    # flushed. Keying on the processed list would leave whitelisted
+    # addresses blocked in the live set forever, because the flush that
+    # would remove them never gets emitted.
+    if [[ "${ENABLE_IPV4:-yes}" != "yes" ]] || [[ -s "$ipv4_raw_file" ]]; then
+      echo "flush set inet ${NFT_TABLE_NAME} ${NFT_SET_NAME_V4}"
+    else
+      echo "# No IPv4 collected, leaving set ${NFT_SET_NAME_V4} unchanged"
+    fi
+
+    if [[ "${ENABLE_IPV6:-yes}" != "yes" ]] || [[ -s "$ipv6_raw_file" ]]; then
+      echo "flush set inet ${NFT_TABLE_NAME} ${NFT_SET_NAME_V6}"
+    else
+      echo "# No IPv6 collected, leaving set ${NFT_SET_NAME_V6} unchanged"
+    fi
 
     output_chunked_elements "$ipv4_file" "$NFT_SET_NAME_V4" "IPv4 addresses"
     output_chunked_elements "$ipv6_file" "$NFT_SET_NAME_V6" "IPv6 addresses"
@@ -470,7 +478,13 @@ download_blacklist() {
     200|301|302|000)
       # 200 = OK
       # 301/302 = Redirect (already followed by -L)
-      # 000 = file:// URL
+      # 000 = file:// URL, but also a connection that never produced a
+      #       response at all (DNS failure, refused, reset). Those two are
+      #       only distinguishable by whether anything actually arrived.
+      if [[ ! -s "$output_file" ]]; then
+        log_warn "Empty response (HTTP $http_code): $url"
+        return 1
+      fi
       return 0
       ;;
     503)
@@ -496,7 +510,7 @@ download_all_blacklists() {
     [[ "$url" =~ ^# ]] && continue
 
     local dl_tmp
-    dl_tmp=$(make_temp)
+    dl_tmp=$(mktemp "$TEMP_DIR/dl.XXXXXX")
 
     if download_blacklist "$url" "$dl_tmp"; then
       # Extract IPv4 if enabled
@@ -512,6 +526,11 @@ download_all_blacklists() {
       ((success_count++)) || true
       show_progress
     fi
+
+    # Drop the downloaded body as soon as it has been extracted. Keeping every
+    # feed's payload until the run exits piles up tens of MB in the scratch
+    # dir for no reason; a failed download can leave a partial body too.
+    rm -f "$dl_tmp"
   done
 
   log_info ""
@@ -528,6 +547,16 @@ download_all_blacklists() {
 #=============================================================================
 
 main() {
+  # Scratch dir for every temporary file this run creates. The trap is armed
+  # immediately after mktemp -d succeeds, so nothing can leak from here on.
+  # The path is baked into the trap now, on purpose: the configuration file is
+  # sourced later and a config that happened to assign TEMP_DIR would
+  # otherwise redirect this "rm -rf", which runs as root. mktemp -d output
+  # cannot contain a single quote, so the quoting below is safe.
+  TEMP_DIR=$(mktemp -d) || die "Cannot create temporary directory"
+  # shellcheck disable=SC2064 # expand TEMP_DIR now, see above
+  trap "rm -rf -- '$TEMP_DIR'" EXIT
+
   # Parse command line arguments
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -561,9 +590,6 @@ main() {
   if [[ -z "$CONFIG_FILE" ]]; then
     die "Please specify a configuration file, e.g. $0 /etc/nftables-blacklist/nftables-blacklist.conf"
   fi
-
-  # Set up cleanup trap
-  trap cleanup EXIT
 
   # Source configuration
   # shellcheck source=nftables-blacklist.conf
@@ -675,10 +701,18 @@ main() {
 
   # Create temporary files for IP collection
   local ipv4_raw ipv6_raw ipv4_clean ipv6_clean
-  ipv4_raw=$(make_temp)
-  ipv6_raw=$(make_temp)
-  ipv4_clean=$(make_temp)
-  ipv6_clean=$(make_temp)
+  ipv4_raw="$TEMP_DIR/ipv4_raw"
+  ipv6_raw="$TEMP_DIR/ipv6_raw"
+  ipv4_clean="$TEMP_DIR/ipv4_clean"
+  ipv6_clean="$TEMP_DIR/ipv6_clean"
+
+  # Create them up front. A family that collects nothing never gets its file
+  # written, and the later wc/cat/grep reads would then fail their input
+  # redirection instead of simply seeing an empty list.
+  : > "$ipv4_raw"
+  : > "$ipv6_raw"
+  : > "$ipv4_clean"
+  : > "$ipv6_clean"
 
   if [[ "$CRON_MODE" == "yes" ]]; then
     log_info "Downloading blacklists..."
@@ -703,7 +737,7 @@ main() {
         before_count=$(wc -l < "$ipv4_clean")
 
         local ipv4_optimized
-        ipv4_optimized=$(make_temp)
+        ipv4_optimized="$TEMP_DIR/ipv4_optimized"
 
         if iprange --optimize "$ipv4_clean" > "$ipv4_optimized" 2>/dev/null && [[ -s "$ipv4_optimized" ]]; then
           mv "$ipv4_optimized" "$ipv4_clean"
@@ -726,8 +760,8 @@ main() {
 
   # Apply whitelist filtering (if configured)
   local whitelist_v4 whitelist_v6
-  whitelist_v4=$(make_temp)
-  whitelist_v6=$(make_temp)
+  whitelist_v4="$TEMP_DIR/whitelist_v4"
+  whitelist_v6="$TEMP_DIR/whitelist_v6"
   local has_whitelist=no
 
   # Collect manual whitelist entries.
@@ -775,7 +809,7 @@ main() {
   if [[ "${AUTO_WHITELIST:-no}" == "yes" ]]; then
     log_info "Auto-detecting server IPs for whitelist..."
     local auto_ips
-    auto_ips=$(make_temp)
+    auto_ips="$TEMP_DIR/auto_ips"
     get_server_ips | sort -u > "$auto_ips"
 
     if [[ -s "$auto_ips" ]]; then
@@ -789,6 +823,12 @@ main() {
         log_info "  Whitelisted: $ip"
       done < "$auto_ips"
       has_whitelist=yes
+    else
+      # Detection returns nothing when the host has no public IP on an
+      # interface (any NAT'd VPS) and the external lookups are unreachable.
+      # Carrying on would apply the blacklist with no whitelist at all and
+      # can block this host out of its own SSH - fail closed instead.
+      die "AUTO_WHITELIST=yes but no server IPs detected; aborting to avoid blocking this host"
     fi
   fi
 
@@ -799,7 +839,7 @@ main() {
     if [[ -s "$ipv4_clean" ]] && [[ -s "$whitelist_v4" ]]; then
       log_info "Applying IPv4 whitelist..."
       local ipv4_filtered
-      ipv4_filtered=$(make_temp)
+      ipv4_filtered="$TEMP_DIR/ipv4_filtered"
       before_wl=$(wc -l < "$ipv4_clean")
 
       if apply_whitelist "$ipv4_clean" "$whitelist_v4" "$ipv4_filtered" "4"; then
@@ -813,7 +853,7 @@ main() {
     if [[ -s "$ipv6_clean" ]] && [[ -s "$whitelist_v6" ]]; then
       log_info "Applying IPv6 whitelist..."
       local ipv6_filtered
-      ipv6_filtered=$(make_temp)
+      ipv6_filtered="$TEMP_DIR/ipv6_filtered"
       before_wl=$(wc -l < "$ipv6_clean")
 
       if apply_whitelist "$ipv6_clean" "$whitelist_v6" "$ipv6_filtered" "6"; then
@@ -822,6 +862,30 @@ main() {
         log_info "  Whitelist applied: $before_wl → $after_wl entries ($((before_wl - after_wl)) removed)"
       fi
     fi
+  fi
+
+  # Applying an empty list would silently wipe the live blacklist. Reached on
+  # a network/DNS outage, but guard the flush itself so any cause is covered.
+  #
+  # Like the flush decision in generate_nft_script(), this keys on the raw
+  # downloads: a run that collected addresses and then filtered every one of
+  # them out (private ranges, whitelist) produced a legitimately empty list
+  # and must be applied, or the entries the operator just whitelisted stay
+  # blocked.
+  if [[ ! -s "$ipv4_raw" ]] && [[ ! -s "$ipv6_raw" ]]; then
+    die "No IPs collected; refusing to apply (would flush the existing blacklist)"
+  fi
+
+  # One family can come up empty while the other has data (a feed that only
+  # carries IPv4, or the single IPv6 feed being down). The generated script
+  # leaves that set alone instead of flushing it - say so, since the set then
+  # keeps the entries from an earlier run.
+  if [[ "${ENABLE_IPV4:-yes}" == "yes" ]] && [[ ! -s "$ipv4_raw" ]]; then
+    log_info "No IPv4 addresses collected; leaving the existing IPv4 set unchanged"
+  fi
+
+  if [[ "${ENABLE_IPV6:-yes}" == "yes" ]] && [[ ! -s "$ipv6_raw" ]]; then
+    log_info "No IPv6 addresses collected; leaving the existing IPv6 set unchanged"
   fi
 
   # Save plain text lists for reference
@@ -839,7 +903,8 @@ main() {
   log_info "Generating nftables script..."
 
   # Generate atomic update script
-  generate_nft_script "$ipv4_clean" "$ipv6_clean" "$NFT_BLACKLIST_SCRIPT"
+  generate_nft_script "$ipv4_clean" "$ipv6_clean" "$NFT_BLACKLIST_SCRIPT" \
+    "$ipv4_raw" "$ipv6_raw"
 
   log_info "Applying nftables rules..."
 
