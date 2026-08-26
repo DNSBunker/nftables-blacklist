@@ -463,12 +463,15 @@ apply_nft_script() {
 download_blacklist() {
   local url="$1"
   local output_file="$2"
+  local etag_file="$3"
   local http_code
 
   http_code=$(curl -L \
     -A "nftables-blacklist/script/github" \
     --connect-timeout "${CURL_CONNECT_TIMEOUT:-10}" \
     --max-time "${CURL_MAX_TIME:-30}" \
+    --etag-compare "$etag_file" \
+    --etag-save "$etag_file" \
     -o "$output_file" \
     -s \
     -w "%{http_code}" \
@@ -485,6 +488,10 @@ download_blacklist() {
         log_warn "Empty response (HTTP $http_code): $url"
         return 1
       fi
+      return 0
+      ;;
+    304)
+      log_info "No list update available (304): $url"
       return 0
       ;;
     503)
@@ -509,18 +516,20 @@ download_all_blacklists() {
     # Skip commented entries (shouldn't happen after sourcing, but be safe)
     [[ "$url" =~ ^# ]] && continue
 
-    local dl_tmp
-    dl_tmp=$(mktemp "$TEMP_DIR/dl.XXXXXX")
+    local hash cache_body cache_etag
+    hash=$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)
+    cache_body="$CACHE_DIR/${hash}.body"
+    cache_etag="$CACHE_DIR/${hash}.etag"
 
-    if download_blacklist "$url" "$dl_tmp"; then
+    if download_blacklist "$url" "$cache_body" "$cache_etag"; then
       # Extract IPv4 if enabled
       if [[ "${ENABLE_IPV4:-yes}" == "yes" ]]; then
-        extract_ipv4 "$dl_tmp" >> "$ipv4_output"
+        extract_ipv4 "$cache_body" >> "$ipv4_output"
       fi
 
       # Extract IPv6 if enabled
       if [[ "${ENABLE_IPV6:-yes}" == "yes" ]]; then
-        extract_ipv6 "$dl_tmp" >> "$ipv6_output"
+        extract_ipv6 "$cache_body" >> "$ipv6_output"
       fi
 
       ((success_count++)) || true
@@ -620,7 +629,7 @@ main() {
   : "${CURL_MAX_TIME:=30}"
 
   # Validate required commands
-  local required_cmds=(curl grep sed sort wc iprange)
+  local required_cmds=(curl grep sed sort wc iprange sha256sum)
   for cmd in "${required_cmds[@]}"; do
     if ! exists "$cmd"; then
       die "Required command not found: $cmd (install with: apt install $cmd)"
@@ -650,6 +659,7 @@ main() {
   local script_dir list_dir
   script_dir=$(dirname "${NFT_BLACKLIST_SCRIPT:-/etc/nftables-blacklist/blacklist.nft}")
   list_dir=$(dirname "${IP_BLACKLIST:-/etc/nftables-blacklist/ip-blacklist.list}")
+  
 
   if [[ ! -d "$script_dir" ]]; then
     die "Directory does not exist: $script_dir (create it or update NFT_BLACKLIST_SCRIPT in config)"
@@ -657,6 +667,11 @@ main() {
 
   if [[ ! -d "$list_dir" ]]; then
     die "Directory does not exist: $list_dir (create it or update IP_BLACKLIST in config)"
+  fi
+
+  : "${CACHE_DIR:=$(dirname "${IP_BLACKLIST:-/etc/nftables-blacklist/ip-blacklist.list}")/cache}"
+  if [[ "$DRY_RUN" != "yes" ]]; then
+    mkdir -p "$CACHE_DIR" || die "Cannot create cache directory: $CACHE_DIR"
   fi
 
   # Check/create nftables structure
